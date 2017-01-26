@@ -7,123 +7,103 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
-	"time"
 )
 
-const KEY_FILENAME = ".ttkey"
+const API_URL = "https://languagetool.org/api/v2/check"
 
-const TOKEN_API = "https://api.cognitive.microsoft.com/sts/v1.0/issueToken"
-const TRANSLATE_API = "https://api.microsofttranslator.com/v2/ajax.svc/Translate"
-
-var ENREGEX = regexp.MustCompile("^[a-zA-Z0-9]")
-var APPKEY []byte
-
-type Token struct {
-	Value   []byte `json:"token"`
-	Expired int64  `json:"expired"`
+type RepValue struct {
+	Value string `json:"value"`
 }
 
-func init() {
-	keyFile := filepath.Join(os.Getenv("HOME"), KEY_FILENAME)
+type Match struct {
+	ShortMessage string     `json:"shortMessage"`
+	Message      string     `json:"message"`
+	Replacements []RepValue `json:"replacements"`
+	Offset       int        `json:"offset"`
+	Length       int        `json:"length"`
+}
+type Matches []Match
 
-	if _, err := os.Stat(keyFile); err != nil {
-		fmt.Printf("API key file ~/%s is not exists.\n", KEY_FILENAME)
-		fmt.Println("Please generate follwing command:")
-		fmt.Printf("echo [your-api-key] > ~/%s\n", KEY_FILENAME)
-		os.Exit(1)
+type CheckResult struct {
+	Matches Matches `json:"matches"`
+}
+
+func NewCheckResult() *CheckResult {
+	return &CheckResult{
+		Matches: Matches{},
 	}
-
-	APPKEY, _ = ioutil.ReadFile(keyFile)
 }
 
 func main() {
 	if len(os.Args) < 2 {
-		fmt.Println("Please pass argument translate word that you want.")
+		fmt.Println("Please pass argument spellcheck words that you want.")
 		os.Exit(1)
 	}
+
 	text := strings.Join(os.Args[1:], " ")
-	from := "ja"
-	to := "en"
-	if ENREGEX.MatchString(text) {
-		from = "en"
-		to = "ja"
-	}
-	token := getToken(APPKEY)
-	translated := translate(token, text, from, to)
-
-	fmt.Println(strings.Replace(translated, "\"", "", -1))
-}
-
-func getToken(key []byte) *Token {
-	var token *Token
-	token = getTokenFromCache()
-	if token != nil {
-		return token
-	}
-
-	fmt.Println("Getting token...")
-	url := fmt.Sprintf("%s?Subscription-Key=%s", TOKEN_API, strings.TrimSpace(string(key)))
-	resp, err := http.Post(url, "", nil)
+	checked, err := doSpellCheck(text)
 	if err != nil {
-		panic(err)
-	}
-	defer resp.Body.Close()
-	if buf, err := ioutil.ReadAll(resp.Body); err != nil {
-		panic(err)
+		fmt.Println("[Error]", err)
 	} else {
-		t := &Token{
-			Value:   buf,
-			Expired: time.Now().Add(10 * time.Minute).Unix(),
+		fmt.Println(format([]rune(text), checked))
+	}
+}
+
+func format(text []rune, c *CheckResult) string {
+	separator := strings.Repeat("=", 40)
+	var line []string
+	for i, m := range c.Matches {
+		line = append(line, "")
+		if i > 0 {
+			line = append(line, separator)
+			line = append(line, "")
 		}
-		if w, err := json.Marshal(t); err == nil {
-			if err := ioutil.WriteFile("/tmp/tttoken", w, 0755); err != nil {
-				fmt.Println("Parsed.")
-			}
+
+		if m.ShortMessage != "" {
+			line = append(line, fmt.Sprintf("\033[93m!! %s !!\033[0m", m.ShortMessage))
 		} else {
-			fmt.Println(err)
+			line = append(line, fmt.Sprintf("\033[93m!! %s !!\033[0m", m.Message))
 		}
-		return t
+		line = append(line, fmt.Sprintf("Word: \033[1m\"%s\"\033[0m, at offset: %d", string(text[m.Offset:(m.Offset+m.Length)]), m.Offset))
+		reps := []string{}
+		for _, r := range m.Replacements {
+			reps = append(reps, r.Value)
+		}
+		line = append(line, fmt.Sprintf("Suggested: \033[92m%s\033[0m", strings.Join(reps, "\033[0m, \033[92m")))
 	}
+	line = append(line, "")
+
+	return strings.Join(line, "\n")
 }
 
-func getTokenFromCache() *Token {
-	if _, err := os.Stat("/tmp/tttoken"); err != nil {
-		return nil
-	}
+func doSpellCheck(text string) (*CheckResult, error) {
+	post := url.Values{}
+	post.Add("text", text)
+	post.Add("language", "en-US")
+	post.Add("enableOnly", "false")
 
-	buf, _ := ioutil.ReadFile("/tmp/tttoken")
-	var t Token
-	if err := json.Unmarshal(buf, &t); err != nil {
-		return nil
-	}
-
-	if t.Expired < time.Now().Unix() {
-		return nil
-	}
-
-	return &t
-}
-
-func translate(token *Token, text, from, to string) string {
-	query := url.Values{}
-	query.Add("text", text)
-	query.Add("from", from)
-	query.Add("to", to)
-	query.Add("contentType", "text/plain")
-
-	apiUrl := fmt.Sprintf("%s?%s", TRANSLATE_API, query.Encode())
-	req, _ := http.NewRequest("GET", apiUrl, nil)
-	req.Header.Add("Authorization", "Bearer "+string(token.Value))
+	req, _ := http.NewRequest("POST", API_URL, strings.NewReader(post.Encode()))
+	req.Header.Add("Accept", "application/json")
+	req.Header.Add("Content-Type", "application/x-www-form-urlencoded")
 
 	client := http.Client{}
 	resp, err := client.Do(req)
 	if err != nil {
-		panic(err)
+		return nil, err
 	}
+
 	defer resp.Body.Close()
-	ret, _ := ioutil.ReadAll(resp.Body)
-	return string(ret)
+
+	if ret, err := ioutil.ReadAll(resp.Body); err != nil {
+		return nil, err
+	} else {
+		r := NewCheckResult()
+
+		if err := json.Unmarshal(ret, r); err != nil {
+			return nil, err
+		}
+
+		return r, nil
+	}
 }
